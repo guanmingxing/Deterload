@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 SECTION_RE = re.compile(r'^\["(?P<name>(?:\\.|[^"\\])*)"\]$')
+POINTS_SECTION_RE = re.compile(r'^\["(?P<name>(?:\\.|[^"\\])*)"\.points\]$')
+INSTS_RE = re.compile(r'^insts\s*=\s*(?P<insts>\d+)$')
 ITEM_RE = re.compile(
     r'^"(?P<checkpoint>(?:\\.|[^"\\])*)"\s*=\s*(?P<weight>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$'
 )
@@ -28,7 +30,7 @@ def parse_args():
     )
     parser.add_argument(
         "toml",
-        help="Input TOML path. Expected format: [\"benchmark\"] checkpoint = weight.",
+        help="Input TOML path. Expected format: [\"benchmark\"] plus [\"benchmark\".points].",
     )
     parser.add_argument(
         "threshold",
@@ -52,6 +54,7 @@ def parse_args():
 def parse_weight_toml(path, strict=False):
     data = {}
     current = None
+    in_points = False
 
     with path.open("r", encoding="utf-8") as file:
         for line_no, raw_line in enumerate(file, start=1):
@@ -59,16 +62,29 @@ def parse_weight_toml(path, strict=False):
             if not line or line.startswith("#"):
                 continue
 
+            points_section = POINTS_SECTION_RE.match(line)
+            if points_section:
+                current = toml_unquote(points_section.group("name"))
+                data.setdefault(current, {"insts": None, "points": {}})
+                in_points = True
+                continue
+
             section = SECTION_RE.match(line)
             if section:
                 current = toml_unquote(section.group("name"))
-                data.setdefault(current, {})
+                data.setdefault(current, {"insts": None, "points": {}})
+                in_points = False
+                continue
+
+            insts = INSTS_RE.match(line)
+            if insts and current is not None and not in_points:
+                data[current]["insts"] = int(insts.group("insts"))
                 continue
 
             item = ITEM_RE.match(line)
-            if item and current is not None:
+            if item and current is not None and in_points:
                 checkpoint = toml_unquote(item.group("checkpoint"))
-                data[current][checkpoint] = float(item.group("weight"))
+                data[current]["points"][checkpoint] = float(item.group("weight"))
                 continue
 
             if strict:
@@ -113,7 +129,12 @@ def render_toml(selected):
             continue
 
         lines.append(f"[{toml_quote(benchmark)}]")
+        if selected[benchmark]["insts"] is not None:
+            lines.append(f"insts = {selected[benchmark]['insts']}")
         lines.append(f"# selected_weight = {selected[benchmark]['total']:.12g}")
+        lines.append("")
+
+        lines.append(f"[{toml_quote(benchmark)}.points]")
         for checkpoint, weight in items:
             lines.append(f"{toml_quote(checkpoint)} = {weight:.12g}")
         lines.append("")
@@ -131,9 +152,10 @@ def main():
     data = parse_weight_toml(input_path, strict=args.strict)
 
     selected = {}
-    for benchmark, items in data.items():
-        chosen, total = select_by_threshold(items, args.threshold)
+    for benchmark, benchmark_data in data.items():
+        chosen, total = select_by_threshold(benchmark_data["points"], args.threshold)
         selected[benchmark] = {
+            "insts": benchmark_data["insts"],
             "items": chosen,
             "total": total,
         }

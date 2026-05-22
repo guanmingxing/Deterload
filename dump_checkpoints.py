@@ -41,6 +41,7 @@ SPEC2006_BENCHMARKS = [
 
 
 CHECKPOINT_RE = re.compile(r"^_(?P<slice>[^_]+)_(?P<weight>.+?)_?\.gz$")
+GUEST_INSTRUCTIONS_PREFIX = "SimPoint profiling exit, total guest instructions = "
 
 
 def escape_spec_name(name):
@@ -83,7 +84,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Copy SPEC2006 checkpoint slices from result/<benchmark>/miao "
-            "and dump checkpoint weights to cluster.toml."
+            "and dump checkpoint weights to simpoint.toml."
         )
     )
     parser.add_argument(
@@ -103,7 +104,7 @@ def parse_args():
         default=None,
         help=(
             "Output TOML path. Defaults to "
-            "<destination>/spec2006_checkpoints/cluster.toml."
+            "<destination>/spec2006_checkpoints/simpoint.toml."
         ),
     )
     parser.add_argument(
@@ -134,10 +135,18 @@ def find_checkpoints(result_path, benchmarks):
         escape_spec_name(benchmark): benchmark
         for benchmark in requested
     }
-    results = {benchmark: [] for benchmark in requested}
+    results = {
+        benchmark: {
+            "insts": None,
+            "points": [],
+        }
+        for benchmark in requested
+    }
 
     for escaped_name, benchmark in escaped_to_name.items():
         miao_dir = result_path / escaped_name / "miao"
+        results[benchmark]["insts"] = find_guest_instructions(result_path, escaped_name)
+
         if not miao_dir.is_dir():
             continue
 
@@ -152,13 +161,65 @@ def find_checkpoints(result_path, benchmarks):
 
                 slice_name = parsed.group("slice")
                 weight = parsed.group("weight")
-                results[benchmark].append({
+                results[benchmark]["points"].append({
                     "slice": slice_name,
                     "weight": weight,
                     "source": checkpoint,
                 })
 
     return results
+
+
+def find_guest_instructions(result_path, escaped_name):
+    profiling_log = find_profiling_log(result_path, escaped_name)
+    if profiling_log is None:
+        return None
+    return parse_guest_instructions(profiling_log)
+
+
+def find_profiling_log(result_path, escaped_name):
+    direct_path = result_path / escaped_name / "profiling.log"
+    if direct_path.is_file():
+        return direct_path
+
+    candidates = []
+    search_dirs = [result_path.parent, result_path.resolve().parent]
+    for search_dir in search_dirs:
+        for path in search_dir.glob(f"*{escaped_name}*profiling/profiling.log"):
+            candidates.append(path)
+        for path in search_dir.glob(f"*{escaped_name}*_profiling/profiling.log"):
+            candidates.append(path)
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        key = candidate.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+
+    if not unique_candidates:
+        return None
+    if len(unique_candidates) > 1:
+        joined = ", ".join(str(path) for path in unique_candidates)
+        raise ValueError(f"multiple profiling logs found for {escaped_name}: {joined}")
+    return unique_candidates[0]
+
+
+def parse_guest_instructions(profiling_log):
+    with profiling_log.open("r", encoding="utf-8", errors="replace") as file:
+        for line in file:
+            if GUEST_INSTRUCTIONS_PREFIX not in line:
+                continue
+
+            value = line.split(GUEST_INSTRUCTIONS_PREFIX, 1)[1].strip()
+            value = value.split()[0].replace(",", "")
+            return int(value)
+
+    raise ValueError(
+        f"guest instructions not found in profiling log: {profiling_log}"
+    )
 
 
 def copy_checkpoints(results, checkpoint_root, dry_run=False):
@@ -168,7 +229,7 @@ def copy_checkpoints(results, checkpoint_root, dry_run=False):
         escaped_name = escape_spec_name(benchmark)
         seen = set()
 
-        for item in sorted(results[benchmark], key=lambda row: int(row["slice"])):
+        for item in sorted(results[benchmark]["points"], key=lambda row: int(row["slice"])):
             if item["slice"] in seen:
                 raise ValueError(
                     f"duplicate checkpoint slice for {benchmark}: {item['slice']}"
@@ -194,11 +255,17 @@ def render_toml(results):
     ]
 
     for benchmark in sorted(results):
-        if not results[benchmark]:
+        points = results[benchmark]["points"]
+        if not points:
             continue
 
         lines.append(f"[{toml_quote(benchmark)}]")
-        for item in sorted(results[benchmark], key=lambda row: int(row["slice"])):
+        if results[benchmark]["insts"] is not None:
+            lines.append(f"insts = {results[benchmark]['insts']}")
+        lines.append("")
+
+        lines.append(f"[{toml_quote(benchmark)}.points]")
+        for item in sorted(points, key=lambda row: int(row["slice"])):
             lines.append(f"{toml_quote(item['slice'])} = {item['weight']}")
         lines.append("")
 
@@ -213,10 +280,10 @@ def main():
 
     destination_root = Path(args.destination)
     checkpoint_root = destination_root / "spec2006_checkpoints"
-    toml_path = Path(args.toml) if args.toml else checkpoint_root / "cluster.toml"
+    toml_path = Path(args.toml) if args.toml else checkpoint_root / "simpoint.toml"
 
     results = find_checkpoints(result_path, args.benchmarks)
-    missing = [name for name, items in results.items() if not items]
+    missing = [name for name, data in results.items() if not data["points"]]
     if args.strict and missing:
         raise FileNotFoundError(
             "missing checkpoints for: " + ", ".join(sorted(missing))
@@ -227,7 +294,7 @@ def main():
         toml_path.parent.mkdir(parents=True, exist_ok=True)
         toml_path.write_text(render_toml(results), encoding="utf-8")
 
-    found_benchmarks = sum(1 for items in results.values() if items)
+    found_benchmarks = sum(1 for data in results.values() if data["points"])
     print(f"Found {found_benchmarks} benchmarks and {copied} checkpoints")
     if args.dry_run:
         print(f"Dry run only; TOML would be written to {toml_path}")
