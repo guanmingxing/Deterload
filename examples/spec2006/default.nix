@@ -75,7 +75,7 @@
   * If `enableVector` is `true`, the default value is `"rv64gc"`,
   * If `enableVector` is `false`, the default value is `"rv64gcv"`.
 */
-, march ? "rv64gc${lib.optionalString enableVector "v"}"
+, march ? "rv64gcb${lib.optionalString enableVector "v"}"
 
 /**
 <arg>testcase-filter</arg>: Function to filter SPEC CPU 2006 testcases.
